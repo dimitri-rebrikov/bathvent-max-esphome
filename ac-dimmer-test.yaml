@@ -1,0 +1,200 @@
+# =============================================================================
+# ac-dimmer-test.yaml — Inbetriebnahme RobotDyn-AC-Dimmer an ESP32 D1 Mini
+# =============================================================================
+# Phase 1: Glühlampe.  Phase 2: Lüfter R2E190-RA (dann "Lüftermodus" einschalten).
+#
+# Hardware:
+#   3V3  -> VCC        GND -> GND
+#   GPIO25 -> PSM      GPIO27 -> Z-C   (Steuerung)
+#   GPIO26 -> Z-C      (Messabgriff, zweite Ader auf denselben Z-C-Kontakt)
+#   10 kOhm von PSM nach GND
+# =============================================================================
+
+substitutions:
+  device_name: ac-dimmer-test
+  friendly_name: AC Dimmer Test
+
+esphome:
+  name: ${device_name}
+  friendly_name: ${friendly_name}
+
+esp32:
+  board: esp32dev
+
+logger:
+  # VERBOSE global, damit ac_dimmer seine "Estimated Frequency" (ESP_LOGV) ausgibt;
+  # die gespraechigen Tags werden einzeln stillgestellt.
+  level: VERBOSE
+  logs:
+    component: WARN
+    web_server: WARN
+    wifi: WARN
+    api: WARN
+    ota: INFO
+    sensor: INFO
+    number: INFO
+    switch: INFO
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: "${device_name} fallback"
+
+captive_portal:
+
+api:
+  encryption:
+    key: !secret api_key
+
+ota:
+  - platform: esphome
+
+web_server:
+  port: 80
+
+# -----------------------------------------------------------------------------
+# Dimmer
+# -----------------------------------------------------------------------------
+output:
+  - platform: ac_dimmer
+    id: dimmer_out
+    gate_pin: GPIO25
+    zero_cross_pin:
+      number: GPIO27
+      mode: INPUT_PULLUP
+    zero_cross_interrupt_type: ANY
+    method: leading pulse
+    min_power: 0.0
+    init_with_half_cycle: false
+
+# Leistungswert 0..100 %. 0 = aus.
+number:
+  - platform: template
+    name: "Leistung"
+    id: power_pct
+    unit_of_measurement: "%"
+    icon: mdi:percent
+    min_value: 0
+    max_value: 100
+    step: 1
+    optimistic: true
+    restore_value: true
+    initial_value: 40
+    set_action:
+      - lambda: |-
+          float v = x;
+          if (id(fan_mode).state && v > 0.0f && v < 40.0f) {
+            ESP_LOGW("dimmer-test", "Lueftermodus: %.0f%% auf 40%% angehoben", x);
+            v = 40.0f;
+          }
+          // Sollwert auf den tatsaechlich angelegten Wert ziehen, sonst zeigt
+          // die Oberflaeche 20 % waehrend 40 % anliegen.
+          id(power_pct).publish_state(v);
+          if (!id(dimmer_enable).state) {
+            ESP_LOGI("dimmer-test", "Sollwert %.0f%% vorgemerkt (Dimmer aus)", v);
+            return;
+          }
+          id(dimmer_out).set_level(v / 100.0f);
+          ESP_LOGI("dimmer-test", "SET level=%.0f%%", v);
+
+switch:
+  - platform: template
+    name: "Dimmer ein"
+    id: dimmer_enable
+    optimistic: true
+    restore_mode: ALWAYS_OFF
+    turn_on_action:
+      - lambda: |-
+          float v = id(power_pct).state;
+          id(dimmer_out).set_level(v / 100.0f);
+          ESP_LOGI("dimmer-test", "EIN level=%.0f%%", v);
+    turn_off_action:
+      - output.set_level:
+          id: dimmer_out
+          level: 0.0
+      - lambda: ESP_LOGI("dimmer-test", "AUS");
+
+  - platform: template
+    name: "Lüftermodus (min 40 %)"
+    id: fan_mode
+    icon: mdi:fan
+    optimistic: true
+    restore_mode: ALWAYS_OFF
+    turn_on_action:
+      - lambda: |-
+          float v = id(power_pct).state;
+          if (v > 0.0f && v < 40.0f) {
+            v = 40.0f;
+            id(power_pct).publish_state(v);
+            if (id(dimmer_enable).state) id(dimmer_out).set_level(v / 100.0f);
+            ESP_LOGW("dimmer-test", "Lueftermodus: Sollwert auf 40%% angehoben");
+          }
+    turn_off_action:
+      - lambda: ESP_LOGI("dimmer-test", "Lueftermodus aus");
+
+# -----------------------------------------------------------------------------
+# Messungen
+# -----------------------------------------------------------------------------
+sensor:
+  # ZC-Leitung parallel mitgezählt (eigene Ader auf GPIO26).
+  # Rechtecksignal des PC817: 1 Flanke pro Netzperiode -> ~50 Hz bei 50 Hz Netz.
+  # Schmale Vollwellenpulse wuerden ~100 Hz zeigen.
+  - platform: pulse_meter
+    name: "ZC Flankenrate"
+    id: zc_rate
+    pin:
+      number: GPIO26
+      mode: INPUT_PULLUP
+    unit_of_measurement: Hz
+    accuracy_decimals: 2
+    icon: mdi:pulse
+    timeout: 2s
+    internal_filter: 1ms
+    filters:
+      - multiply: 0.01666667
+
+  - platform: uptime
+    name: "Laufzeit"
+    id: uptime_s
+    update_interval: 30s
+
+  - platform: wifi_signal
+    name: "WLAN RSSI"
+    id: wifi_rssi
+    update_interval: 30s
+
+# -----------------------------------------------------------------------------
+# Logzeile mit allen Messwerten
+# -----------------------------------------------------------------------------
+interval:
+  - interval: 5s
+    then:
+      - lambda: |-
+          const float HALF_US = 10000.0f;   // 10 ms Halbwelle bei 50 Hz
+          const float PI_F = 3.14159265f;
+          float zc = id(zc_rate).state;
+          float up = id(uptime_s).state;
+          float rssi = id(wifi_rssi).state;
+          if (isnan(zc)) zc = 0.0f;
+          if (isnan(up)) up = 0.0f;
+          if (isnan(rssi)) rssi = 0.0f;
+          bool on = id(dimmer_enable).state;
+          float lvl = on ? id(power_pct).state : 0.0f;
+
+          // Nachbildung von ac_dimmer::write_state(): RMS-Kompensation per acos
+          float value = 0.0f;
+          if (lvl > 0.0f && lvl < 100.0f) {
+            value = acosf(1.0f - 2.0f * (lvl / 100.0f)) / PI_F;
+          } else if (lvl >= 100.0f) {
+            value = 1.0f;
+          }
+          float delay_ms = (1.0f - value) * HALF_US / 1000.0f;
+
+          ESP_LOGI("dimmer-test",
+                   "ein=%d level=%.0f%% zc=%.1fHz delay=%.2fms leitwinkel=%.0fdeg "
+                   "uptime=%.0fs rssi=%.0fdBm%s",
+                   on ? 1 : 0, lvl, zc, (lvl > 0.0f ? delay_ms : 0.0f),
+                   (lvl > 0.0f ? 180.0f * value : 0.0f),
+                   up, rssi,
+                   zc < 1.0f ? "  [KEIN ZC-SIGNAL]" : "");
